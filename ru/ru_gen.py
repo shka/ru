@@ -26,8 +26,8 @@ import toml
 
 from ru.arguments import get_parser
 from ru.basecall import Mapper as CustomMapper
-from ru.basecall import __all__ as callers
-from ru.utils import print_args, get_run_info, between, setup_logger, dynamic_import
+from ru.basecall import GuppyCaller as Caller
+from ru.utils import print_args, get_run_info, between, setup_logger, describe_experiment
 from ru.utils import send_message, Severity
 
 
@@ -54,15 +54,18 @@ class ThreadPoolExecutorStackTraced(concurrent.futures.ThreadPoolExecutor):
 
 def simple_analysis(
         client,
-        caller="GPU",
         batch_size=512,
         throttle=0.1,
         unblock_duration=0.5,
-        chunk_log=None,
-        paf_log=None,
-        toml_path=None,
+        cl=None,
+        pf=None,
+        live_toml_path=None,
         flowcell_size=512,
         dry_run=False,
+        run_info=None,
+        conditions=None,
+        mapper=None,
+        caller_kwargs=None,
 ):
     """Analysis function
 
@@ -70,61 +73,57 @@ def simple_analysis(
     ----------
     client : read_until.ReadUntilClient
         An instance of the ReadUntilClient object
-    caller : str
-        Base caller to use, one of CPU or GPU
     batch_size : int
         The number of reads to be retrieved from the ReadUntilClient at a time
     throttle : int or float
         The number of seconds interval between requests to the ReadUntilClient
     unblock_duration : int or float
         Time, in seconds, to apply unblock voltage
-    chunk_log : str
+    cl : logging.Logger
         Log file to log chunk data to
-    paf_log : str
+    pf : logging.Logger
         Log file to log alignments to
-    toml_path : str
-        Path to a TOML configuration file for read until
+    live_toml_path : str
+        Path to a `live` TOML configuration file for read until. If this exists when
+        the run starts it will be deleted
     flowcell_size : int
         The number of channels on the flowcell, 512 for MinION and 3000 for PromethION
     dry_run : bool
         If True unblocks are replaced with `stop_receiving` commands
+    run_info : dict
+        Dictionary of {channel: index} where index corresponds to an index in `conditions`
+    conditions : list
+        Experimental conditions as List of namedtuples.
+    mapper : mappy.Aligner
+    caller_kwargs : dict
 
     Returns
     -------
     None
     """
-    Caller = dynamic_import("ru.basecall.{}".format(caller))
+    # Init logger for this function
     logger = logging.getLogger(__name__)
-    toml_dict = toml.load(toml_path)
-    live_file = Path("{}_live".format(toml_path))
-    if live_file.is_file():
-        live_file.unlink()
 
-    # There may or may not be a reference
-    run_info, conditions, reference = get_run_info(toml_dict, num_channels=flowcell_size)
+    # Delete live TOML file if it exists
+    live_toml_path = Path(live_toml_path)
+    if live_toml_path.is_file():
+        live_toml_path.unlink()
+
     # TODO: test this
     # Write channels.toml
     d = {"conditions": {str(v): {"channels": [], "name": conditions[v].name} for k, v in run_info.items()}}
     for k, v in run_info.items():
         d["conditions"][str(v)]["channels"].append(k)
+
     channels_out = str(client.mk_run_dir / "channels.toml")
     with open(channels_out, "w") as fh:
+        fh.write("# This file is written as a record of the condition each channel is assigned.\n")
+        fh.write("# It may be changed or overwritten if you restart Read Until.\n")
+        fh.write("# In the future this file may become a CSV file.\n")
         toml.dump(d, fh)
 
-    guppy_kwargs = toml_dict.get(
-        "guppy_connection",
-        {
-            "config": "dna_r9.4.1_450bps_fast",
-            "host": "127.0.0.1",
-            "port": 5555,
-            "procs": 4,
-            "inflight": 512,
-        }
-    )
-
-    caller = Caller(**guppy_kwargs)
+    caller = Caller(**caller_kwargs)
     # What if there is no reference or an empty MMI
-    mapper = CustomMapper(reference)
 
     # DefaultDict[int: collections.deque[Tuple[str, ndarray]]]
     #  tuple is (read_id, previous_signal)
@@ -157,8 +156,6 @@ def simple_analysis(
     below_threshold = False
     exceeded_threshold = False
 
-    cl = setup_logger("DEC", log_file=chunk_log)
-    pf = setup_logger("PAF", log_file=paf_log)
     l_string = (
         "client_iteration",
         "read_in_loop",
@@ -180,27 +177,35 @@ def simple_analysis(
     l_string = "\t".join(("{}" for _ in l_string))
     loop_counter = 0
     while client.is_running:
-        if live_file.is_file():
-            # We may want to update the reference under certain conditions here.
-            run_info, conditions, new_reference = get_run_info(live_file, flowcell_size)
-            if new_reference != reference:
+        if live_toml_path.is_file():
+            # Reload the TOML config from the *_live file
+            run_info, conditions, new_reference, _ = get_run_info(live_toml_path, flowcell_size)
+
+            # Check the reference path if different from the loaded mapper
+            if new_reference != mapper.index:
+                old_reference = mapper.index
+                # Log to file and MinKNOW interface
                 logger.info("Reloading mapper")
-                send_message(client.connection,"Reloading mapper. Read Until paused.",Severity.INFO)
-                # We need to update our mapper client.
+                send_message(client.connection, "Reloading mapper. Read Until paused.", Severity.INFO)
+
+                # Update mapper client.
                 mapper = CustomMapper(new_reference)
+                # Log on success
                 logger.info("Reloaded mapper")
-                if reference:
-                    logger.info("Deleting old mmi {}".format(reference))
+
+                # If we've reloaded a reference, delete the previous one
+                if old_reference:
+                    logger.info("Deleting old mmi {}".format(old_reference))
                     # We now delete the old mmi file.
-                    Path(reference).unlink()
+                    Path(old_reference).unlink()
                     logger.info("Old mmi deleted.")
-            reference = new_reference
 
         # TODO: Fix the logging to just one of the two in use
 
-        if not reference:
+        if not mapper.initialised:
             time.sleep(throttle)
             continue
+
         loop_counter += 1
         t0 = timer()
         r = 0
@@ -391,6 +396,10 @@ def run_workflow(client, analysis_worker, n_workers, run_time, runner_kwargs=Non
     except KeyboardInterrupt:
         logger.info("Caught ctrl-c, terminating workflow.")
         client.reset()
+    except Exception as e:
+        logger.exception("Got exception", exc_info=e)
+        client.reset()
+        raise
 
     # collect results (if any)
     collected = []
@@ -412,15 +421,6 @@ def run_workflow(client, analysis_worker, n_workers, run_time, runner_kwargs=Non
 
 def main():
     extra_args = (
-        (
-            "--caller",
-            dict(
-                metavar="CALLER",
-                default=callers[0],
-                choices=callers,
-                help="Base calling system to use: CPU or GPU",
-            ),
-        ),
         (
             "--toml",
             dict(
@@ -446,7 +446,6 @@ def main():
     )
     parser, args = get_parser(extra_args=extra_args, file=__file__)
 
-    # TODO: Move logging config to separate configuration file
     # set up logging to file for DEBUG messages and above
     logging.basicConfig(
         level=logging.DEBUG,
@@ -471,7 +470,19 @@ def main():
     logger.info(" ".join(sys.argv))
     print_args(args, logger=logger)
 
+    # Setup chunk and paf logs
+    chunk_logger = setup_logger("DEC", log_file=args.chunk_log)
+    paf_logger = setup_logger("PAF", log_file=args.paf_log)
 
+    # Parse configuration TOML
+    # TODO: num_channels is not configurable here, should be inferred from client
+    run_info, conditions, reference, caller_kwargs = get_run_info(args.toml, num_channels=512)
+    live_toml = Path("{}_live".format(args.toml))
+
+    # Load Minimap2 index
+    logger.info("Initialising minimap2 mapper")
+    mapper = CustomMapper(reference)
+    logger.info("Mapper initialised")
 
     read_until_client = read_until.ReadUntilClient(
         mk_host=args.host,
@@ -484,21 +495,46 @@ def main():
         cache_size=args.cache_size,
     )
 
-    send_message(read_until_client.connection,"Read Until is controlling sequencing on this device. You use it at your own risk.", Severity.WARN)
+    send_message(
+        read_until_client.connection,
+        "Read Until is controlling sequencing on this device. You use it at your own risk.",
+        Severity.WARN,
+    )
+
+    for message, sev in describe_experiment(conditions, mapper):
+        logger.info(message)
+
+        send_message(
+            read_until_client.connection,
+            message,
+            sev,
+        )
+
+    """
+    This experiment has N regions on the flowcell.
+
+    using reference: /path/to/ref.mmi
+
+    Region i:NAME (control=bool) has X targets of which Y are found in the reference.
+    reads will be unblocked when [u,v], sequenced when [w,x] and polled for more data when [y,z].
+    """
 
     # FIXME: currently flowcell size is not included, this should be pulled from
     #  the read_until_client
     analysis_worker = functools.partial(
         simple_analysis,
         read_until_client,
-        caller = args.caller,
         unblock_duration=args.unblock_duration,
         throttle=args.throttle,
         batch_size=args.batch_size,
-        chunk_log=args.chunk_log,
-        paf_log=args.paf_log,
-        toml_path=args.toml,
+        cl=chunk_logger,
+        pf=paf_logger,
+        live_toml_path=live_toml,
         dry_run=args.dry_run,
+        run_info=run_info,
+        conditions=conditions,
+        mapper=mapper,
+        caller_kwargs=caller_kwargs,
     )
 
     results = run_workflow(
@@ -512,10 +548,13 @@ def main():
             "last_channel": max(args.channels),
         },
     )
-    # describe(results)
+
     # No results returned
-    send_message(read_until_client.connection,
-                 "Read Until is disconnected from this device. Sequencing will proceed normally.", Severity.WARN)
+    send_message(
+        read_until_client.connection,
+        "Read Until is disconnected from this device. Sequencing will proceed normally.",
+        Severity.WARN,
+    )
 
 
 if __name__ == "__main__":
