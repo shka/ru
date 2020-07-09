@@ -83,7 +83,10 @@ def main():
     if not Path(reference).is_file():
         raise FileNotFoundError("reference file not found at: {}".format(reference))
 
-    mapper = mp.Aligner(reference, preset="map-ont")
+    # mapper = mp.Aligner(reference, preset="map-ont")
+    mapper = mp.Aligner(reference,
+                        preset="splice",
+                        extra_flags=0x100) # MM_F_SPLICE_FOR -uf
 
     print("Using reference: {}".format(reference), file=sys.stderr)
 

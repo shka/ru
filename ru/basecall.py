@@ -119,7 +119,10 @@ class Mapper:
     def __init__(self, index):
         self.index = index
         if self.index:
-            self.mapper = mp.Aligner(self.index, preset="map-ont")
+            # self.mapper = mp.Aligner(self.index, preset="map-ont")
+            self.mapper = mp.Aligner(self.index,
+                                     preset="splice",
+                                     extra_flags=0x100) # MM_F_SPLICE_FOR -uf
             self.initialised = True
         else:
             self.mapper = None
